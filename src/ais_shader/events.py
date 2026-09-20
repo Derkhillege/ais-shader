@@ -651,11 +651,27 @@ def _evaluate_candidates_in_window(
     min_moving_speed: float = 0.5,
     max_segment_duration_s: float = 1800.0,
 ) -> list:
-    """Evaluate pairwise encounters within a spatio-temporal window."""
+    """Evaluate pairwise encounters within a spatio-temporal window.
+
+    Requires segments_metric to be sorted by segment_start_time. Uses binary
+    search (np.searchsorted) to bound candidate segments to O(log N) temporal lookups,
+    avoiding full-table boolean scans.
+    """
     start_times = segments_metric['segment_start_time'].values
     end_times = segments_metric['segment_end_time'].values
-    in_bin = (start_times <= t_end.to_datetime64()) & (end_times >= t_start.to_datetime64())
-    indices = np.where(in_bin)[0]
+
+    t_min_start = (t_start - pd.Timedelta(seconds=max_segment_duration_s)).to_datetime64()
+    t_max_start = t_end.to_datetime64()
+    i_left = np.searchsorted(start_times, t_min_start, side='left')
+    i_right = np.searchsorted(start_times, t_max_start, side='right')
+    if i_left >= i_right:
+        return []
+
+    sub_start = start_times[i_left:i_right]
+    sub_end = end_times[i_left:i_right]
+    sub_mask = (sub_start <= t_end.to_datetime64()) & (sub_end >= t_start.to_datetime64())
+    indices = i_left + np.where(sub_mask)[0]
+
     if len(indices) < 2:
         return []
 
@@ -905,6 +921,7 @@ def detect_encounters(
 
     gdf['segment_start_time'] = to_utc_datetime(gdf['segment_start_time'])
     gdf['segment_end_time'] = to_utc_datetime(gdf['segment_end_time'])
+    gdf = gdf.sort_values('segment_start_time').reset_index(drop=True)
 
     t_min = gdf['segment_start_time'].min()
     t_max = gdf['segment_end_time'].max()
