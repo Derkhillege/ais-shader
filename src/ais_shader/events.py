@@ -439,7 +439,46 @@ ENCOUNTER_COLS = [
     'is_stationary_1', 'is_stationary_2', 'stationary_role',
     'start_time', 'end_time', 'cpa_time', 'min_distance_m',
     'overtaking_mmsi', 'overtaken_mmsi',
+    'is_abaft_beam', 'abaft_beam_deg',
 ]
+
+
+def check_abaft_the_beam(
+    p_forward: np.ndarray,
+    heading_forward: float,
+    p_overtaking: np.ndarray,
+    sector_deg: float = 67.5,
+) -> tuple[bool, float]:
+    """Check whether p_overtaking approaches p_forward from > 22°30' abaft the beam.
+
+    Regulatory Context (BPR art. 6.01 & COLREGS Rule 13):
+        - BPR (Inland Navigation Police Regulations) art. 6.01(b) ("oplopen"):
+          approaching of a vessel by another vessel from a direction more than
+          22°30' abaft the beam of that vessel.
+        - BPR art. 6.01(c) ("voorbijlopen"): maneuver resulting from overtaking
+          until the vessels are entirely clear of each other.
+        - COLREGS Rule 13(b) uses the identical geometric definition: approaching
+          from a direction more than 22.5° (22°30') abaft her beam (the 135° sternlight
+          sector, ±67.5° from dead astern).
+
+    Dead astern is 180° relative to heading_forward.
+    Approaching from > 22°30' abaft the beam corresponds to within ±67.5° of dead astern (135° sector).
+
+    Returns:
+        (is_abaft, abaft_beam_deg)
+        where abaft_beam_deg is degrees abaft the beam (> 22.5 when within the sector).
+    """
+    diff_x = float(p_overtaking[0] - p_forward[0])
+    diff_y = float(p_overtaking[1] - p_forward[1])
+    norm = float(np.hypot(diff_x, diff_y))
+    if norm < 1e-6:
+        return (False, 0.0)
+    bearing_from_fwd = (np.degrees(np.arctan2(diff_x, diff_y)) + 360.0) % 360.0
+    rel_bearing = (bearing_from_fwd - heading_forward) % 360.0
+    dev_from_stern = abs(rel_bearing - 180.0)
+    abaft_beam_deg = 90.0 - dev_from_stern
+    is_abaft = bool(dev_from_stern <= sector_deg)
+    return (is_abaft, abaft_beam_deg)
 
 
 def classify_encounter(
@@ -450,20 +489,26 @@ def classify_encounter(
     ds_start: float = None,
     ds_end: float = None,
     dv_along: float = None,
+    is_abaft: bool = None,
     min_moving_speed: float = 0.5,
     min_overtaking_speed_diff: float = 0.5,
 ) -> str:
-    """
-    Classify encounter between two vessels based on relative course and along-track passing.
+    """Classify encounter between two vessels based on relative course, along-track passing, and approach angle.
+
+    Regulatory Context (BPR art. 6.01 & COLREGS Rule 13 / 14 / 15):
+      - 'head-on' (BPR art. 6.01(a), "naderen op tegengestelde koersen"): vessels approaching
+        each other on courses that are directly or nearly directly opposite (135° <= rel_angle <= 225°).
+      - 'overtaking' (BPR art. 6.01(b/c), "oplopen" & "voorbijlopen"):
+          * overtaking approach (6.01(b)): approaching from a direction > 22°30' abaft the beam (is_abaft is True);
+          * passing maneuver (6.01(c)): along-track passing occurs until vessels are clear.
+      - 'parallel_sailing': same general direction (rel_angle <= 45°) without passing (e.g. coupled or co-sailing).
+      - 'crossing' (BPR art. 6.01(d), "kruisende koersen"): courses intersecting at an angle (45° < rel_angle < 135°
+        or 225° < rel_angle < 315°), or same-direction approaches outside the > 22°30' abaft-the-beam sector
+        (approaching from abeam or forward of the beam).
+      - 'stationary': both vessels are stationary/moored (< min_moving_speed m/s).
 
     Returns:
-      'head-on'          : opposite courses (135 <= rel_angle <= 225)
-      'overtaking'       : same general direction (rel_angle <= 45) AND along-track passing occurs
-                           (ds_start * ds_end <= 0 or active passing with speed differential),
-                           or defaults to 'overtaking' when ds_start/ds_end are not provided
-      'parallel_sailing' : same general direction (rel_angle <= 45) without passing (co-sailing abreast)
-      'crossing'         : courses intersecting at an angle (45 < rel_angle < 135 or 225 < rel_angle < 315)
-      'stationary'       : both vessels are stationary/moored (< min_moving_speed m/s)
+      'head-on', 'overtaking', 'parallel_sailing', 'crossing', or 'stationary'.
     """
     if speed1 is not None and speed2 is not None:
         if speed1 < min_moving_speed and speed2 < min_moving_speed:
@@ -473,6 +518,9 @@ def classify_encounter(
     rel_angle = min(diff, 360.0 - diff)
 
     if rel_angle <= 45.0:
+        if is_abaft is False:
+            return "crossing"
+
         if ds_start is not None and ds_end is not None:
             order_flipped = (ds_start * ds_end < -1.0)
             has_speed_diff = (dv_along is not None and abs(dv_along) >= min_overtaking_speed_diff)
@@ -566,9 +614,17 @@ def compute_segment_cpa(
         ds_end = 0.0
         dv_along = 0.0
 
+    is_abaft = None
+    if ds_start is not None and abs(ds_start) > 1.0:
+        if ds_start > 0:
+            is_abaft, _ = check_abaft_the_beam(r1_0, heading1, r2_0)
+        else:
+            is_abaft, _ = check_abaft_the_beam(r2_0, heading2, r1_0)
+
     enc_type = classify_encounter(
         heading1, heading2, speed1, speed2,
         ds_start=ds_start, ds_end=ds_end, dv_along=dv_along,
+        is_abaft=is_abaft,
     )
 
     return (cpa_dist_m, cpa_time, p1_cpa, p2_cpa, mid_cpa, heading1, heading2, speed1, speed2,
@@ -827,6 +883,21 @@ def _evaluate_candidates_in_window(
             target_mmsi = mmsi[idx2]
             role_1 = 'moving' if not is_stat_1 else 'stationary'
             role_2 = 'moving' if not is_stat_2 else 'stationary'
+        t_prox_init = max(t1_s, t2_s)
+        off1 = (t_prox_init - t1_s).total_seconds()
+        off2 = (t_prox_init - t2_s).total_seconds()
+        v_seg1 = (ends[idx1] - starts[idx1]) / dur1 if dur1 > 1e-6 else np.zeros(2)
+        v_seg2 = (ends[idx2] - starts[idx2]) / dur2 if dur2 > 1e-6 else np.zeros(2)
+        p1_init = starts[idx1] + v_seg1 * off1
+        p2_init = starts[idx2] + v_seg2 * off2
+
+        is_abaft = None
+        abaft_deg = np.nan
+        if ds_start is not None and abs(ds_start) > 1.0:
+            if ds_start > 0:
+                is_abaft, abaft_deg = check_abaft_the_beam(p1_init, heading1, p2_init)
+            else:
+                is_abaft, abaft_deg = check_abaft_the_beam(p2_init, heading2, p1_init)
 
         rec = {
             'encounter_type': enc_type,
@@ -861,6 +932,8 @@ def _evaluate_candidates_in_window(
             'min_distance_m': cpa_dist_m,
             'overtaking_mmsi': overtaking_mmsi,
             'overtaken_mmsi': overtaken_mmsi,
+            'is_abaft_beam': is_abaft,
+            'abaft_beam_deg': abaft_deg,
             '_mid_x': float(mid_cpa[0]),
             '_mid_y': float(mid_cpa[1]),
             '_ds_start': ds_start,
@@ -1102,31 +1175,36 @@ def _merge_encounters(raw_df: pd.DataFrame, merge_gap_minutes: float) -> list:
             rel_angle = 90.0
 
         if enc_type in {'overtaking', 'parallel_sailing'} or rel_angle <= 45.0 or (overall_order_flipped and rel_angle <= 60.0):
-            has_speed_diff = abs(overall_dv_along) >= 0.5
-            if overall_order_flipped or (has_speed_diff and (initial_ds * final_ds <= 0.0 and abs(initial_ds - final_ds) > 1.0)):
-                enc_type = 'overtaking'
-                if overall_dv_along > 0:
-                    overtaking_mmsi = res['mmsi_1']
-                    overtaken_mmsi = res['mmsi_2']
-                elif overall_dv_along < 0:
-                    overtaking_mmsi = res['mmsi_2']
-                    overtaken_mmsi = res['mmsi_1']
-                else:
-                    s1 = res.get('speed_mps_1', 0.0) or 0.0
-                    s2 = res.get('speed_mps_2', 0.0) or 0.0
-                    if s1 >= s2:
-                        overtaking_mmsi = res['mmsi_1']
-                        overtaken_mmsi = res['mmsi_2']
-                    else:
-                        overtaking_mmsi = res['mmsi_2']
-                        overtaken_mmsi = res['mmsi_1']
-            elif rel_angle <= 45.0:
-                enc_type = 'parallel_sailing'
+            if res.get('is_abaft_beam') is False:
+                enc_type = 'crossing'
                 overtaking_mmsi = None
                 overtaken_mmsi = None
             else:
-                overtaking_mmsi = None
-                overtaken_mmsi = None
+                has_speed_diff = abs(overall_dv_along) >= 0.5
+                if overall_order_flipped or (has_speed_diff and (initial_ds * final_ds <= 0.0 and abs(initial_ds - final_ds) > 1.0)):
+                    enc_type = 'overtaking'
+                    if overall_dv_along > 0:
+                        overtaking_mmsi = res['mmsi_1']
+                        overtaken_mmsi = res['mmsi_2']
+                    elif overall_dv_along < 0:
+                        overtaking_mmsi = res['mmsi_2']
+                        overtaken_mmsi = res['mmsi_1']
+                    else:
+                        s1 = res.get('speed_mps_1', 0.0) or 0.0
+                        s2 = res.get('speed_mps_2', 0.0) or 0.0
+                        if s1 >= s2:
+                            overtaking_mmsi = res['mmsi_1']
+                            overtaken_mmsi = res['mmsi_2']
+                        else:
+                            overtaking_mmsi = res['mmsi_2']
+                            overtaken_mmsi = res['mmsi_1']
+                elif rel_angle <= 45.0:
+                    enc_type = 'parallel_sailing'
+                    overtaking_mmsi = None
+                    overtaken_mmsi = None
+                else:
+                    overtaking_mmsi = None
+                    overtaken_mmsi = None
 
         res['encounter_type'] = enc_type
         res['overtaking_mmsi'] = overtaking_mmsi
@@ -1439,7 +1517,7 @@ def generate_encounter_timeseries(
     lookup = _build_trajectory_lookup(segments_gdf, max_gap_seconds=max_gap_seconds)
 
     if client is not None and len(encounters_gdf) > 50:
-        logger.info(f"Distributing time series generation across encounters with Dask...")
+        logger.info("Distributing time series generation across encounters with Dask...")
         n_workers = len(client.scheduler_info().get('workers', {})) or 4
         n_chunks = max(8, n_workers * 4)
         chunk_size = int(np.ceil(len(encounters_gdf) / n_chunks))
